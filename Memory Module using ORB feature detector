@@ -1,0 +1,376 @@
+import cv2
+import pickle
+import time
+import os
+import numpy as np
+import threading
+from collections import deque
+
+# -------------------------
+# CONFIG
+# -------------------------
+LOCATION_DB_FILE = "location_db.pkl"
+OBJECT_DB_FILE = "object_db.pkl"
+
+IP_CAMERA_URL = 0 #use ip address of camera
+USE_IP_CAMERA = True
+
+OBJ_CONFIRM_TIME = 3.0
+SAVE_COOLDOWN = 5
+
+FRAME_SIZE = (480, 360)
+
+orb = cv2.ORB_create(nfeatures=400)
+
+# -------------------------
+# SHARED STATE
+# -------------------------
+latest_frame = None
+lock = threading.Lock()
+
+loc_final = "Unknown"
+stable_obj = None
+object_location_memory = {}
+last_saved_time = 0
+
+# -------------------------
+# CAMERA
+# -------------------------
+def get_camera():
+    if USE_IP_CAMERA:
+        cap = cv2.VideoCapture(IP_CAMERA_URL)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(0)
+    else:
+        cap = cv2.VideoCapture(0)
+    return cap
+
+# -------------------------
+# LOAD DATABASES
+# -------------------------
+location_db = {}
+object_db = {}
+
+if os.path.exists(LOCATION_DB_FILE):
+    try:
+        with open(LOCATION_DB_FILE, "rb") as f:
+            location_db = pickle.load(f)
+    except:
+        location_db = {}
+
+if os.path.exists(OBJECT_DB_FILE):
+    try:
+        with open(OBJECT_DB_FILE, "rb") as f:
+            object_db = pickle.load(f)
+    except:
+        object_db = {}
+
+# -------------------------
+# SEGMENT OBJECT
+# -------------------------
+def segment_object(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (7,7), 0)
+
+    thresh = cv2.adaptiveThreshold(
+        blur, 255,
+        cv2.ADAPTIVE_THRESH_MEAN_C,
+        cv2.THRESH_BINARY_INV,
+        11, 2
+    )
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        return frame
+
+    largest = max(contours, key=cv2.contourArea)
+
+    if cv2.contourArea(largest) < 2000:
+        return frame
+
+    mask = np.zeros_like(gray)
+    cv2.drawContours(mask, [largest], -1, 255, -1)
+
+    result = cv2.bitwise_and(frame, frame, mask=mask)
+
+    x, y, w, h = cv2.boundingRect(largest)
+    return result[y:y+h, x:x+w]
+
+# -------------------------
+# MATCH FUNCTION
+# -------------------------
+def match_db(des, db):
+
+    if des is None or len(db) == 0:
+        return None, 0
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+
+    best_match = None
+    best_score = 0
+
+    for name in db:
+
+        stored = np.array(db[name]["descriptors"], dtype=np.uint8)
+
+        if len(stored) < 2:
+            continue
+
+        matches = bf.knnMatch(stored, des, k=2)
+
+        good = []
+        for pair in matches:
+            if len(pair) < 2:
+                continue
+            m, n = pair
+            if m.distance < 0.7*n.distance:
+                good.append(m)
+
+        if len(good) > best_score:
+            best_score = len(good)
+            best_match = name
+
+    return best_match, best_score
+
+# -------------------------
+# LEARN LOCATION
+# -------------------------
+def learn_location(room, name):
+
+    cap = get_camera()
+    collected = []
+
+    print("SPACE: capture | S: save")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        frame = cv2.resize(frame, FRAME_SIZE)
+
+        cv2.putText(frame, f"{room} - {name}", (20,30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+
+        cv2.imshow("Learn Location", frame)
+
+        key = cv2.waitKey(5) & 0xFF
+
+        if key == 27:
+            break
+
+        elif key == 32:
+            print("Capturing...")
+            for _ in range(30):
+                ret, f = cap.read()
+                if ret:
+                    gray = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+                    _, des = orb.detectAndCompute(gray, None)
+                    if des is not None:
+                        collected.append(des)
+                cv2.waitKey(30)
+
+        elif key == ord('s'):
+            if not collected:
+                continue
+
+            final = np.vstack(collected)
+            final = np.unique(final, axis=0)
+
+            if room not in location_db:
+                location_db[room] = {}
+
+            location_db[room][name] = {"descriptors": final.tolist()}
+
+            with open(LOCATION_DB_FILE, "wb") as f:
+                pickle.dump(location_db, f)
+
+            print("Location saved")
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+# -------------------------
+# LEARN OBJECT
+# -------------------------
+def learn_object(name):
+
+    cap = get_camera()
+    collected = []
+
+    print("SPACE: capture | S: save")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        frame = cv2.resize(frame, FRAME_SIZE)
+
+        cv2.putText(frame, f"Object: {name}", (20,30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+
+        cv2.imshow("Learn Object", frame)
+
+        key = cv2.waitKey(5) & 0xFF
+
+        if key == 27:
+            break
+
+        elif key == 32:
+            print("Capturing...")
+            for _ in range(40):
+                ret, f = cap.read()
+                if ret:
+                    roi = segment_object(f)
+                    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                    _, des = orb.detectAndCompute(gray, None)
+                    if des is not None and len(des) > 30:
+                        collected.append(des)
+                cv2.waitKey(30)
+
+        elif key == ord('s'):
+            if not collected:
+                continue
+
+            final = np.vstack(collected)
+            final = np.unique(final, axis=0)
+
+            object_db[name] = {"descriptors": final.tolist()}
+
+            with open(OBJECT_DB_FILE, "wb") as f:
+                pickle.dump(object_db, f)
+
+            print("Object saved")
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+# -------------------------
+# DETECTION THREAD
+# -------------------------
+def detection_loop(room_db):
+
+    global latest_frame, loc_final, stable_obj
+    global object_location_memory, last_saved_time
+
+    loc_history = deque(maxlen=20)
+    obj_start = None
+
+    while True:
+
+        with lock:
+            if latest_frame is None:
+                continue
+            frame = latest_frame.copy()
+
+        # LOCATION
+        gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        _, des_full = orb.detectAndCompute(gray_full, None)
+
+        loc, score = match_db(des_full, room_db)
+        loc_history.append(loc if score > 25 else "Unknown")
+        loc_final = max(set(loc_history), key=loc_history.count)
+
+        # OBJECT
+        roi = segment_object(frame)
+        gray_obj = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        _, des_obj = orb.detectAndCompute(gray_obj, None)
+
+        obj, obj_score = match_db(des_obj, object_db)
+
+        if obj_score > 50:
+            if obj != stable_obj:
+                stable_obj = obj
+                obj_start = time.time()
+        else:
+            stable_obj = None
+            obj_start = None
+
+        obj_ok = stable_obj and (time.time() - obj_start > OBJ_CONFIRM_TIME)
+
+        # MEMORY
+        if obj_ok and loc_final != "Unknown":
+            if time.time() - last_saved_time > SAVE_COOLDOWN:
+                object_location_memory[stable_obj] = loc_final
+                last_saved_time = time.time()
+                print(f"Saved: {stable_obj} → {loc_final}")
+
+# -------------------------
+# DETECT
+# -------------------------
+def detect():
+
+    print("Rooms:", list(location_db.keys()))
+    room = input("Enter room: ")
+
+    if room not in location_db:
+        return
+
+    room_db = location_db[room]
+
+    cap = get_camera()
+
+    threading.Thread(target=detection_loop, args=(room_db,), daemon=True).start()
+
+    while True:
+
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        frame = cv2.resize(frame, FRAME_SIZE)
+
+        with lock:
+            global latest_frame
+            latest_frame = frame.copy()
+
+        text = f"You are near {loc_final}"
+
+        if stable_obj:
+            if stable_obj in object_location_memory:
+                text += f" | {stable_obj} (last at {object_location_memory[stable_obj]})"
+            else:
+                text += f" | {stable_obj} detected"
+
+        cv2.putText(frame, text, (20,40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+
+        cv2.imshow("Ultra Smooth Detection", frame)
+
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+# -------------------------
+# MENU
+# -------------------------
+while True:
+
+    print("\n--- Vision Memory System ---")
+    print("1 Learn Location")
+    print("2 Learn Object")
+    print("3 Detect")
+    print("4 Exit")
+
+    choice = input("Select: ")
+
+    if choice == "1":
+        room = input("Room: ")
+        name = input("Location label: ")
+        learn_location(room, name)
+
+    elif choice == "2":
+        name = input("Object name: ")
+        learn_object(name)
+
+    elif choice == "3":
+        detect()
+
+    elif choice == "4":
+        break
