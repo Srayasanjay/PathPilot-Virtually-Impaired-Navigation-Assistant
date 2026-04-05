@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""
+PathPilot  — Scene description + OCR + object detection
+"""
+
+import cv2
+import sounddevice as sd
+import whisper
+import numpy as np
+import threading
+import time
+import tempfile
+import subprocess
+from queue import Queue, Empty
+import wave
+import os
+from pytesseract import pytesseract
+from ultralytics import YOLO
+
+# -----------------------------
+# SETTINGS
+# -----------------------------
+VISION_MODEL = "llava"
+WHISPER_MODEL = "tiny.en"
+IP_CAMERA_URL = 0
+LISTEN_DURATION = 3.0
+DESCRIBE_TRIGGERS = ["describe", "what do you see", "what's around", "describe the scene", "what's in front", "tell me about this scene", "look around"]
+TEXT_TRIGGERS = ["read", "text", "letters", "label", "sign"]
+VISION_QUESTIONS = ["is there a", "can you see", "do you see", "is there any", "are there", "what kind of", "how many", "where is"]
+EXIT_TRIGGERS = ["exit", "quit", "stop", "goodbye"]
+OLLAMA_TIMEOUT = 25
+LISTEN_BEEP = "listen_beep.wav"
+YOLO_DOWNSCALE = (320, 192)
+# -----------------------------
+
+voice_q = Queue()
+audio_error_count = 0
+
+# -----------------------------
+# AUDIO / TTS CONTROL
+# -----------------------------
+def mute_microphone():
+    try:
+        subprocess.run(["osascript", "-e", "set volume input volume 0"], capture_output=True)
+    except:
+        pass
+
+def unmute_microphone():
+    try:
+        subprocess.run(["osascript", "-e", "set volume input volume 50"], capture_output=True)
+    except:
+        pass
+
+def play_listen_sound():
+    try:
+        import simpleaudio as sa
+        if os.path.exists(LISTEN_BEEP):
+            wave_obj = sa.WaveObject.from_wave_file(LISTEN_BEEP)
+            wave_obj.play()
+    except:
+        pass
+
+def speak(text):
+    print(f"\nAssistant 🧠: {text}\n")
+    mute_microphone()
+    try:
+        clean_text = text.replace('"', '').replace("'", "").replace("(", "").replace(")", "")
+        if len(clean_text) > 300:
+            clean_text = clean_text[:297] + "..."
+        subprocess.run(["say", "-v", "Samantha", "-r", "180", clean_text],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except:
+        pass
+    finally:
+        time.sleep(1.0)
+        unmute_microphone()
+
+# -----------------------------
+# LOAD MODELS
+# -----------------------------
+print("Loading Whisper model…")
+whisper_model = whisper.load_model(WHISPER_MODEL)
+print("Whisper ready.")
+
+print("Loading YOLOv8 model…")
+yolo_model = YOLO("yolov8n.pt")
+print("YOLO ready.")
+
+# -----------------------------
+# AUDIO LISTENER
+# -----------------------------
+def whisper_listener():
+    global audio_error_count
+    fs = 16000
+    last_speak_time = 0
+    COOLDOWN_PERIOD = 2.5
+    
+    while True:
+        try:
+            current_time = time.time()
+            if current_time - last_speak_time < COOLDOWN_PERIOD:
+                time.sleep(0.1)
+                continue
+            if audio_error_count > 3:
+                print("Too many audio errors, waiting...")
+                time.sleep(3)
+                audio_error_count = 0
+
+            play_listen_sound()
+            print("(🎤 Listening...)")
+            
+            audio = sd.rec(int(LISTEN_DURATION * fs), samplerate=fs, channels=1, dtype='float32')
+            sd.wait()
+            
+            rms = np.sqrt(np.mean(audio**2))
+            if rms < 0.005:
+                continue
+
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp_path = tmp.name
+                with wave.open(tmp_path, 'w') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(fs)
+                    wf.writeframes((audio * 32767).astype(np.int16).tobytes())
+
+                result = whisper_model.transcribe(tmp_path, language='en', fp16=False)
+                text = result.get("text", "").strip().lower()
+                os.unlink(tmp_path)
+
+                skip_phrases = ["let me check", "analyzing", "i can see", "i see", 
+                                "there is", "there are", "assistant", "hello", "goodbye", "exit", "quit"]
+                if text and len(text) > 2 and not any(phrase in text for phrase in skip_phrases):
+                    print(f"🗣️ You said: {text}")
+                    voice_q.put(text)
+                    audio_error_count = 0
+
+        except Exception as e:
+            print(f"Audio error: {e}")
+            audio_error_count += 1
+            time.sleep(1)
+
+# -----------------------------
+# OCR
+# -----------------------------
+def ocr_text(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    text = pytesseract.image_to_string(gray)
+    return text.strip()
+
+# -----------------------------
+# LLava Vision
+# -----------------------------
+def query_ollama_vision(image_path, prompt):
+    try:
+        result = subprocess.run(
+            ["ollama", "run", VISION_MODEL, prompt, "-f", image_path],
+            capture_output=True, text=True, timeout=OLLAMA_TIMEOUT
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+        return None
+    except subprocess.TimeoutExpired:
+        return "Trouble analyzing the scene."
+    except:
+        return None
+
+# -----------------------------
+# YOLO OBJECT DETECTION (Fallback)
+# -----------------------------
+def quick_object_detection(frame):
+    small = cv2.resize(frame, YOLO_DOWNSCALE)
+    results = yolo_model(small)
+    detected = []
+    h, w = small.shape[:2]
+    for box in results[0].boxes:
+        cls_id = int(box.cls[0])
+        label = yolo_model.names.get(cls_id, str(cls_id))
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        cx = (x1 + x2) // 2
+        pos = "ahead"
+        if cx < w/3:
+            pos = "on your left"
+        elif cx > 2*w/3:
+            pos = "on your right"
+        detected.append(f"{label} {pos}")
+    return list(dict.fromkeys(detected))  # remove duplicates
+
+# -----------------------------
+# MAIN LOOP
+# -----------------------------
+def main():
+    speak("PathPilot ready.")
+
+    threading.Thread(target=whisper_listener, daemon=True).start()
+
+    cap = cv2.VideoCapture(IP_CAMERA_URL)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        speak("Cannot access camera.")
+        return
+
+    last_frame = None
+
+    while True:
+        ret, frame = cap.read()
+        if ret:
+            last_frame = frame.copy()
+            cv2.imshow("PathPilot - Live View", frame)
+
+        try:
+            user_input = voice_q.get_nowait()
+            print(f"Processing: {user_input}")
+
+            if any(trigger in user_input for trigger in EXIT_TRIGGERS):
+                speak("Goodbye! Stay safe.")
+                break
+
+            # OCR mode
+            elif any(trigger in user_input for trigger in TEXT_TRIGGERS):
+                if last_frame is None:
+                    speak("I don't have a camera view right now.")
+                    continue
+                text = ocr_text(last_frame)
+                if text:
+                    speak(f"I see text: {text}")
+                else:
+                    speak("I don't see any readable text.")
+
+            # Scene description
+            elif any(trigger in user_input for trigger in DESCRIBE_TRIGGERS + VISION_QUESTIONS):
+                if last_frame is None:
+                    speak("I don't have a camera view right now.")
+                    continue
+                speak("Checking the scene...")
+
+                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_image:
+                    cv2.imwrite(tmp_image.name, last_frame)
+                    temp_image_path = tmp_image.name
+
+                prompt = "Describe this scene concisely for a visually impaired person."
+                response = query_ollama_vision(temp_image_path, prompt)
+
+                if response:
+                    speak(response)
+                else:
+                    # fallback: OCR + YOLO
+                    text = ocr_text(last_frame)
+                    if text:
+                        speak(f"I see text: {text}")
+                    else:
+                        objects = quick_object_detection(last_frame)
+                        if objects:
+                            speak("I see " + ", ".join(objects))
+                        else:
+                            speak("I don't see any clear objects right now.")
+
+                if os.path.exists(temp_image_path):
+                    os.unlink(temp_image_path)
+
+            # Fallback for unknown
+            else:
+                speak("I'm not sure how to respond.")
+
+        except Empty:
+            pass
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            speak("Exiting PathPilot.")
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+# -----------------------------
+# RUN
+# -----------------------------
+if __name__ == "__main__":
+    main()
