@@ -6,3 +6,5 @@ A Navigation assistant for visually impaired users, build using various AI model
 4. Scene Description using LLM
 5. Memory model using ORB feature extractor and VSLAM
 
+Demo Video
+https://drive.google.com/file/d/1rq5cLiUpUet_2mMw5H_mHIH21dtPG3UA/view?usp=sharing
